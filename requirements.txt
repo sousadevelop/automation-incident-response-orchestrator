@@ -1,0 +1,2 @@
+# Notion IR webhook — stdlib only, no external packages required.
+# Vercel Python runtime includes stdlib; nothing to install.
