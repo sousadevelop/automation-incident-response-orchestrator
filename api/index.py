@@ -1,16 +1,11 @@
-"""
-Notion IR — Webhook receiver for Grafana alerts.
-Vercel Python Serverless Function (handler signature).
-Implements idempotency via Fingerprint lookup before creating cards.
-"""
-
+from http.server import BaseHTTPRequestHandler
 import json
 import os
 import urllib.request
 import urllib.error
 
 NOTION_TOKEN = os.environ.get("NOTION_TOKEN", "")
-NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "")  # 4d5281f79dda49e9881c0029fea5127d
+NOTION_DB_ID = os.environ.get("NOTION_DB_ID", "")
 
 SEVERITY_MAP = {
     "critical": "Crítica",
@@ -18,111 +13,95 @@ SEVERITY_MAP = {
     "info":     "Baixa",
     "ok":       "Baixa",
 }
-
 STATUS_DEFAULT = "Triagem / Investigação"
 
 
-def _notion_request(method: str, path: str, body: dict | None = None) -> dict:
+def _notion(method, path, body=None):
     headers = {
         "Authorization": f"Bearer {NOTION_TOKEN}",
         "Content-Type": "application/json",
         "Notion-Version": "2022-06-28",
     }
-    url = f"https://api.notion.com/v1{path}"
     data = json.dumps(body).encode() if body else None
-    req = urllib.request.Request(url, data=data, headers=headers, method=method)
-    with urllib.request.urlopen(req) as resp:
-        return json.loads(resp.read())
+    req = urllib.request.Request(
+        f"https://api.notion.com/v1{path}", data=data, headers=headers, method=method
+    )
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read())
 
 
-def fingerprint_exists(fingerprint: str) -> bool:
-    payload = {
-        "filter": {
-            "property": "Fingerprint",
-            "rich_text": {"equals": fingerprint},
-        }
-    }
-    result = _notion_request("POST", f"/databases/{NOTION_DB_ID}/query", payload)
-    return len(result.get("results", [])) > 0
+def fingerprint_exists(fp):
+    res = _notion("POST", f"/databases/{NOTION_DB_ID}/query",
+                  {"filter": {"property": "Fingerprint", "rich_text": {"equals": fp}}})
+    return len(res.get("results", [])) > 0
 
 
-def build_fingerprint(alert: dict) -> str:
+def build_fp(alert):
     if fp := alert.get("fingerprint"):
         return fp
-    labels   = alert.get("labels", {})
-    env      = labels.get("env", labels.get("cluster", "unknown"))
-    domain   = labels.get("job", labels.get("namespace", "unknown"))
-    name     = labels.get("alertname", "alert").lower().replace(" ", "-")
-    date_str = (alert.get("startsAt", "")[:10]) or "unknown-date"
-    return f"{env}/{domain}/{name}-{date_str}"
+    labels = alert.get("labels", {})
+    env    = labels.get("env", labels.get("cluster", "unknown"))
+    domain = labels.get("job", labels.get("namespace", "unknown"))
+    name   = labels.get("alertname", "alert").lower().replace(" ", "-")
+    date   = (alert.get("startsAt", "")[:10]) or "unknown"
+    return f"{env}/{domain}/{name}-{date}"
 
 
-def create_notion_card(alert: dict) -> dict:
-    labels   = alert.get("labels", {})
-    anns     = alert.get("annotations", {})
-    title    = anns.get("summary") or labels.get("alertname", "Alerta sem título")
-    severity = SEVERITY_MAP.get(
-        alert.get("status", "").lower(),
-        SEVERITY_MAP.get(labels.get("severity", "").lower(), "Baixa")
-    )
-    fp = build_fingerprint(alert)
-    payload = {
+def create_card(alert):
+    labels = alert.get("labels", {})
+    anns   = alert.get("annotations", {})
+    title  = anns.get("summary") or labels.get("alertname", "Alerta")
+    sev    = SEVERITY_MAP.get(alert.get("status", "").lower(),
+             SEVERITY_MAP.get(labels.get("severity", "").lower(), "Baixa"))
+    fp     = build_fp(alert)
+    return _notion("POST", "/pages", {
         "parent": {"database_id": NOTION_DB_ID},
         "properties": {
             "Name":        {"title": [{"text": {"content": title}}]},
             "Status":      {"select": {"name": STATUS_DEFAULT}},
-            "Severity":    {"select": {"name": severity}},
+            "Severity":    {"select": {"name": sev}},
             "Fingerprint": {"rich_text": [{"text": {"content": fp}}]},
         },
-    }
-    return _notion_request("POST", "/pages", payload)
-
-
-# ── Vercel serverless handler ──────────────────────────────────────────────────
-
-def handler(request, response):
-    """Vercel Python serverless function entry point."""
-
-    if request.method == "GET":
-        response.status_code = 200
-        return json.dumps({"status": "ok", "service": "notion-ir"})
-
-    if request.method != "POST":
-        response.status_code = 405
-        return json.dumps({"error": "Method not allowed"})
-
-    try:
-        body = request.body
-        if isinstance(body, (bytes, bytearray)):
-            body = body.decode()
-        payload = json.loads(body)
-    except Exception as e:
-        response.status_code = 400
-        return json.dumps({"error": f"Invalid JSON: {e}"})
-
-    if not NOTION_TOKEN or not NOTION_DB_ID:
-        response.status_code = 500
-        return json.dumps({"error": "Missing NOTION_TOKEN or NOTION_DB_ID env vars"})
-
-    alerts = payload.get("alerts", [payload])
-    created, skipped, errors = [], [], []
-
-    for alert in alerts:
-        fp = build_fingerprint(alert)
-        try:
-            if fingerprint_exists(fp):
-                skipped.append(fp)
-                continue
-            page = create_notion_card(alert)
-            created.append({"fingerprint": fp, "notion_page": page.get("id")})
-        except urllib.error.HTTPError as e:
-            errors.append({"fingerprint": fp, "error": e.read().decode()})
-        except Exception as e:
-            errors.append({"fingerprint": fp, "error": str(e)})
-
-    response.status_code = 200
-    return json.dumps({
-        "created": created,
-        "skipped_idempotent": skipped,
-        "errors": errors,
     })
+
+
+class handler(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+
+    def _send(self, status, body):
+        out = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", len(out))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def do_GET(self):
+        self._send(200, {"status": "ok", "service": "notion-ir"})
+
+    def do_POST(self):
+        if not NOTION_TOKEN or not NOTION_DB_ID:
+            self._send(500, {"error": "missing env vars"})
+            return
+        try:
+            length  = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(length))
+        except Exception as e:
+            self._send(400, {"error": f"bad json: {e}"}); return
+
+        alerts  = payload.get("alerts", [payload])
+        created, skipped, errors = [], [], []
+        for alert in alerts:
+            fp = build_fp(alert)
+            try:
+                if fingerprint_exists(fp):
+                    skipped.append(fp)
+                else:
+                    page = create_card(alert)
+                    created.append({"fingerprint": fp, "notion_page": page.get("id")})
+            except urllib.error.HTTPError as e:
+                errors.append({"fingerprint": fp, "error": e.read().decode()})
+            except Exception as e:
+                errors.append({"fingerprint": fp, "error": str(e)})
+
+        self._send(200, {"created": created, "skipped_idempotent": skipped, "errors": errors})
